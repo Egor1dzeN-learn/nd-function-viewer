@@ -9,12 +9,29 @@ from pathlib import Path
 
 import numpy as np
 
-from function_parser import MAX_DIMENSION
+from function_parser import MAX_DIMENSION, VARIABLES
 
-DLL_PATH = Path(__file__).resolve().parent / "native" / "testfuncs.dll"
+NATIVE_DIR = Path(__file__).resolve().parent / "native"
+DLL_PATH = NATIVE_DIR / "testfuncs.dll"
+PLUGIN_DLL_PATH = NATIVE_DIR / "plugins.dll"
 
 _lib = None
 _load_error = None
+_plugin_lib = None
+
+_VP, _DP, _IP = ctypes.c_void_p, ctypes.POINTER(ctypes.c_double), ctypes.c_int
+
+
+def _load(path: Path) -> ctypes.CDLL:
+    """Loads a library and declares the functions common to testfuncs.dll and plugins.dll."""
+    lib = ctypes.CDLL(str(path))
+    lib.tf_last_error.restype = ctypes.c_char_p
+    lib.tf_destroy.argtypes = [_VP]
+    lib.tf_dimension.argtypes, lib.tf_dimension.restype = [_VP], _IP
+    lib.tf_bounds.argtypes = [_VP, _DP, _DP]
+    lib.tf_optimum.argtypes, lib.tf_optimum.restype = [_VP, _DP, _DP], _IP
+    lib.tf_evaluate.argtypes, lib.tf_evaluate.restype = [_VP, _DP, _IP, _DP], _IP
+    return lib
 
 
 def _library() -> ctypes.CDLL:
@@ -24,22 +41,32 @@ def _library() -> ctypes.CDLL:
     if _load_error is not None:
         raise RuntimeError(_load_error)
     try:
-        lib = ctypes.CDLL(str(DLL_PATH))
+        lib = _load(DLL_PATH)
     except OSError as exc:
         _load_error = f"Failed to load {DLL_PATH.name}: {exc}. Build it with: python native/build.py"
         raise RuntimeError(_load_error) from None
 
-    vp, dp, ip = ctypes.c_void_p, ctypes.POINTER(ctypes.c_double), ctypes.c_int
-    lib.tf_last_error.restype = ctypes.c_char_p
-    lib.tf_create_gcgen.argtypes, lib.tf_create_gcgen.restype = [ip, ip, ip, ip, ip], vp
-    lib.tf_create_classic.argtypes, lib.tf_create_classic.restype = [ctypes.c_char_p, ip], vp
-    lib.tf_destroy.argtypes = [vp]
-    lib.tf_dimension.argtypes, lib.tf_dimension.restype = [vp], ip
-    lib.tf_bounds.argtypes = [vp, dp, dp]
-    lib.tf_optimum.argtypes, lib.tf_optimum.restype = [vp, dp, dp], ip
-    lib.tf_evaluate.argtypes, lib.tf_evaluate.restype = [vp, dp, ip, dp], ip
-    lib.tf_classic_names.argtypes, lib.tf_classic_names.restype = [ctypes.c_char_p, ip], ip
+    lib.tf_create_gcgen.argtypes, lib.tf_create_gcgen.restype = [_IP, _IP, _IP, _IP, _IP], _VP
+    lib.tf_create_classic.argtypes, lib.tf_create_classic.restype = [ctypes.c_char_p, _IP], _VP
+    lib.tf_classic_names.argtypes, lib.tf_classic_names.restype = [ctypes.c_char_p, _IP], _IP
     _lib = lib
+    return lib
+
+
+def _plugin_library() -> ctypes.CDLL:
+    global _plugin_lib
+    if _plugin_lib is not None:
+        return _plugin_lib
+    try:
+        lib = _load(PLUGIN_DLL_PATH)
+    except OSError as exc:
+        raise RuntimeError(f"Failed to load {PLUGIN_DLL_PATH.name}: {exc}") from None
+
+    lib.tf_plugin_names.argtypes, lib.tf_plugin_names.restype = [ctypes.c_char_p, _IP], _IP
+    lib.tf_plugin_dimensions.argtypes = [ctypes.c_char_p, ctypes.POINTER(_IP), ctypes.POINTER(_IP)]
+    lib.tf_plugin_dimensions.restype = _IP
+    lib.tf_create_plugin.argtypes, lib.tf_create_plugin.restype = [ctypes.c_char_p, _IP], _VP
+    _plugin_lib = lib
     return lib
 
 
@@ -58,8 +85,9 @@ def _as_ptr(array: np.ndarray):
 class TestProblem:
     """A single test problem: dimension, bounds, known minimum and evaluation."""
 
-    def __init__(self, handle: int | None, title: str):
-        lib = _library()
+    def __init__(self, handle: int | None, title: str, lib: ctypes.CDLL | None = None):
+        lib = lib or _library()
+        self._lib = lib
         if not handle:
             raise ValueError(lib.tf_last_error().decode(errors="replace"))
         self._handle = handle
@@ -79,13 +107,13 @@ class TestProblem:
         """points is an array of shape (n, dimension); returns n function values."""
         points = np.ascontiguousarray(points, dtype=np.float64).reshape(-1, self.dimension)
         out = np.empty(len(points))
-        if not _library().tf_evaluate(self._handle, _as_ptr(points), len(points), _as_ptr(out)):
-            raise ValueError(_library().tf_last_error().decode(errors="replace"))
+        if not self._lib.tf_evaluate(self._handle, _as_ptr(points), len(points), _as_ptr(out)):
+            raise ValueError(self._lib.tf_last_error().decode(errors="replace"))
         return out
 
     def __del__(self):
-        if getattr(self, "_handle", None) and _lib is not None:
-            _lib.tf_destroy(self._handle)
+        if getattr(self, "_handle", None):
+            self._lib.tf_destroy(self._handle)
             self._handle = None
 
 
@@ -163,3 +191,39 @@ def classic_catalog() -> list[ClassicInfo]:
         if drawable:
             catalog.append(ClassicInfo(name, scalable, drawable))
     return sorted(catalog, key=lambda info: (not info.scalable, info.name))
+
+
+def plugin_catalog() -> list[ClassicInfo]:
+    """Functions from plugins/*.cpp. Raises RuntimeError with a message for the user if they cannot be listed."""
+    lib = _plugin_library()
+    size = lib.tf_plugin_names(None, 0)
+    if size == 0:
+        raise RuntimeError(lib.tf_last_error().decode(errors="replace"))
+    buffer = ctypes.create_string_buffer(size)
+    lib.tf_plugin_names(buffer, size)
+    names = buffer.value.decode().splitlines()
+    if not names:
+        raise RuntimeError("No functions are registered in plugins/: use NFV_REGISTER_FUNCTION")
+    duplicates =sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise RuntimeError(f"Several plugins use the same name: {', '.join(duplicates)}")
+
+    catalog = []
+    for name in names:
+        low, high = ctypes.c_int(), ctypes.c_int()
+        if not lib.tf_plugin_dimensions(name.encode(), ctypes.byref(low), ctypes.byref(high)):
+            raise RuntimeError(lib.tf_last_error().decode(errors="replace"))
+        dimensions = tuple(range(max(low.value, 1), min(high.value, MAX_DIMENSION) + 1))
+        if not dimensions:
+            raise RuntimeError(f"{name}: supports no dimension from 1 to {MAX_DIMENSION}")
+        catalog.append(ClassicInfo(name, len(dimensions) > 1, dimensions))
+    return sorted(catalog, key=lambda info: info.name)
+
+
+def plugin_problem(name: str, dimension: int) -> TestProblem:
+    lib = _plugin_library()
+    problem = TestProblem(lib.tf_create_plugin(name.encode(), dimension), name, lib)
+    # Above 4D the viewer has one range for all variables.
+    if problem.dimension > len(VARIABLES) and (np.ptp(problem.lower) > 0 or np.ptp(problem.upper) > 0):
+        raise ValueError(f"{name}: above {len(VARIABLES)}D all variables must share one range")
+    return problem

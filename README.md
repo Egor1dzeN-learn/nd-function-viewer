@@ -15,7 +15,8 @@ Function sources (tabs on the left):
   (this tab needs the native library, see [below](#building-the-test-function-library)):
   GCGen families — Hill (1D, 1000 problems), Shekel (1D, 1000), Hansen (1D, 20), Grishagin (2D, 100),
   GKLS (2–12D, 100 problems, Simple/Hard classes, ND/D/D2 types) — and classic functions
-  (Rastrigin, Ackley, Eggholder, etc., up to 12D). The known global minimum is marked on the plot.
+  (Rastrigin, Ackley, Eggholder, etc., up to 12D). The known global minimum is marked on the plot;
+- **Plugins** — your own functions in Python or C++, see [below](#adding-your-own-function).
 
 ## Functions of three and four variables
 
@@ -103,46 +104,98 @@ PRESETS = [
 
 Variables without a range use the range of `x`. Above 4D all variables share the first range.
 
-**In the Test problems tab, with a known minimum.** Formulas cannot mark the minimum on the plot, so such a function
-is written in C++ in your copy of global-opt:
+**As a Python plugin.** Use this for functions that are too long for a formula or need the minimum marked on the
+plot. Nothing has to be built.
 
-1. Declare it in `include/test_functions/classic_functions.h`:
+1. Add a `.py` file to the `plugins/` folder and derive a class from `Function`:
 
-   ```cpp
-   TestFunction my_function(size_t dim);
+   ```python
+   import numpy as np
+
+   from nd_function import Function, box
+
+
+   class MyFunction(Function):
+       name = "My Python function"  # must be unique, the class name by default
+       min_dimension = 1            # supported dimensions, within 1 to 12
+       max_dimension = 12
+
+       def bounds(self, dimension):
+           return box(dimension, -5, 5)
+
+       def evaluate(self, x):
+           return np.sum(x**2, axis=1)
+
+       # Optional: mark the global minimum on the plot.
+       def minimum(self, dimension):
+           return [0.0] * dimension, 0.0
    ```
 
-2. Define it in `src/test_functions/classic_functions.cpp` next to the other functions. The return value holds the
-   name, dimension, bounds, the function, the minimum value and the point of the minimum:
+2. Restart the application and open the **Plugins** tab.
+
+`evaluate` receives all points at once as an array of shape `(n, dimension)` and returns `n` values, so use numpy
+columns such as `x[:, 0]` instead of looping over the points. To give each variable its own range, return
+`[(-6, 6), (-3, 3)]` from `bounds`. One file can hold several classes, and `plugins/example_functions.py` is a working
+example. Files and classes whose names start with `_` are skipped. If a plugin cannot be loaded, the error is shown in
+the tab and the others keep working.
+
+**As a C++ plugin.** Use this for functions that are expensive to compute. It needs only `g++` in PATH, global-opt is
+not required.
+
+1. Add a `.cpp` file to the `plugins/` folder, derive a class from `nfv::Function` and register it:
 
    ```cpp
-   TestFunction my_function(size_t dim) {
-       auto f = [](const Point &x) {
-           double s = 0.0;
-           for (double xi: x) s += xi * xi;
-           return s;
-       };
-       return {"my_function", dim, box(dim, -5.0, 5.0), f, 0.0, Point(dim, 0.0)};
-   }
+   #include "nd_function.hpp"
+
+   class MyFunction : public nfv::Function {
+   public:
+       std::string name() const override { return "My function"; }  // must be unique
+       int min_dimension() const override { return 1; }             // supported dimensions, within 1 to 12
+       int max_dimension() const override { return 12; }
+       nfv::Bounds bounds(int dimension) const override { return nfv::box(dimension, -5.0, 5.0); }
+
+       double evaluate(const nfv::Point &x) const override {
+           double sum = 0.0;
+           for (double coordinate: x) sum += coordinate * coordinate;
+           return sum;
+       }
+
+       // Optional: mark the global minimum on the plot.
+       bool minimum(int dimension, nfv::Point &point, double &value) const override {
+           point.assign(dimension, 0.0);
+           value = 0.0;
+           return true;
+       }
+   };
+
+   NFV_REGISTER_FUNCTION(MyFunction)
    ```
 
-3. Register it in `scalable_registry()` in the same file:
+2. Close the application and build all plugins into `native/plugins.dll`:
 
-   ```cpp
-   {"my_function", my_function},
+   ```
+   .venv\Scripts\python native\build_plugins.py
    ```
 
-4. Rebuild the library with `.venv\Scripts\python native\build.py` and restart the application.
-   The function appears in the **Classic** family.
+3. Start the application and open the **Plugins** tab.
+
+One file can hold several classes, and `plugins/example_functions.cpp` is a working example. To give each variable its
+own range, return `{{-6.0, 6.0}, {-3.0, 3.0}}` from `bounds`. Above 4D all variables must share one range.
 
 ## Files
 
 - `main.py` — the application window and drawing;
 - `hyperslice.py` — the HyperSlice view for `N > 4`;
 - `function_parser.py` — safe formula parsing (whitelisted functions, no arbitrary code execution);
-- `test_functions.py` — Python wrapper over `testfuncs.dll` (ctypes) and the problem catalog;
+- `test_functions.py` — Python wrapper over `testfuncs.dll` and `plugins.dll` (ctypes) and the problem catalogs;
+- `plugins/` — your Python and C++ functions;
+- `nd_function.py` — the `Function` base class for Python plugins;
+- `plugin_loader.py` — finds the Python and C++ plugins;
+- `native/nd_function.hpp` — the `nfv::Function` base class for C++ plugins;
+- `native/plugin_capi.cpp` — C interface to the plugins;
+- `native/build_plugins.py` — plugin build script;
 - `native/testfuncs_capi.cpp` — C interface to the GCGen problems and classic functions;
-- `native/build.py` — DLL build script;
+- `native/build.py` — build script of the test function library;
 - `colormaps.py` — colormaps.
 
 ## Third-party software

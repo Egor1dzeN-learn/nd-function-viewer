@@ -17,6 +17,7 @@ import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+import plugin_loader
 import test_functions as tf
 from colormaps import COLORMAP_NAMES, get_colormap
 from function_parser import HELP_TEXT, VARIABLES, Formula, FormulaError, variable_names
@@ -63,6 +64,7 @@ LIGHT_DIR = np.array([0.4, 0.3, 0.85]) / np.linalg.norm([0.4, 0.3, 0.85])
 LABEL_COLOR = (220, 220, 220, 255)
 OPTIMUM_COLOR = (1.0, 1.0, 1.0, 1.0)
 CLASSIC_FAMILY = "Classic"
+FORMULA_TAB, TEST_TAB, PLUGIN_TAB = 0, 1, 2
 MODE_SURFACE, MODE_GRID = "Animated surface", "Slice grid"
 SLICE_DEFAULTS = {3: 41, 4: 17}  # slices per extra variable; odd, so the middle of the range is included
 MAX_POINTS = 4_000_000           # 3D/4D: the surface resolution is reduced to stay within this budget
@@ -188,6 +190,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._formula_ranges = None  # ranges of the "Formula" tab while test problems are open
         if self._classic_catalog:
             self._on_family_changed()
+        if self._plugin_catalog:
+            self._on_plugin_changed()
         self.preset_box.setCurrentIndex(0)
         self._apply_preset(0)
 
@@ -202,6 +206,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.source_tabs = QtWidgets.QTabWidget()
         self.source_tabs.addTab(self._build_formula_page(), "Formula")
         self.source_tabs.addTab(self._build_test_page(), "Test problems")
+        self.source_tabs.addTab(self._build_plugin_page(), "Plugins")
+        self._source_tab = FORMULA_TAB
         self.source_tabs.currentChanged.connect(self._on_source_changed)
         layout.addWidget(self.source_tabs)
 
@@ -397,6 +403,39 @@ class MainWindow(QtWidgets.QMainWindow):
             box.currentIndexChanged.connect(self._load_problem)
         return page
 
+    def _build_plugin_page(self) -> QtWidgets.QWidget:
+        """Functions written in Python or C++ in the plugins folder."""
+        page = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(page)
+        self._plugin_catalog, errors = plugin_loader.load_catalog()
+        message = "\n".join(errors)
+        if message:
+            label = QtWidgets.QLabel(message)
+            label.setWordWrap(True)
+            label.setStyleSheet("color: #d33;")
+            form.addRow(label)
+        if not self._plugin_catalog:
+            self._plugin_error = message or "No plugins found. Add a .py file to the plugins folder and restart."
+            if not message:
+                form.addRow(QtWidgets.QLabel(self._plugin_error))
+            return page
+        self._plugin_error = ""
+
+        self.plugin_box = QtWidgets.QComboBox()
+        for info in self._plugin_catalog:
+            self.plugin_box.addItem(info.name, info)
+        form.addRow("Function:", self.plugin_box)
+        self.plugin_dim = QtWidgets.QSpinBox()
+        form.addRow("Dimension:", self.plugin_dim)
+        self.plugin_info = QtWidgets.QLabel()
+        self.plugin_info.setWordWrap(True)
+        self.plugin_info.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        form.addRow(self.plugin_info)
+
+        self.plugin_box.currentIndexChanged.connect(self._on_plugin_changed)
+        self.plugin_dim.valueChanged.connect(self._load_problem)
+        return page
+
     @staticmethod
     def _range_spin() -> QtWidgets.QDoubleSpinBox:
         spin = QtWidgets.QDoubleSpinBox()
@@ -467,18 +506,26 @@ class MainWindow(QtWidgets.QMainWindow):
         return [(lo.value(), hi.value()) for lo, hi in self.range_spins]
 
     def _test_mode(self) -> bool:
-        return self.source_tabs.currentIndex() == 1
+        return self.source_tabs.currentIndex() != FORMULA_TAB
 
-    def _on_source_changed(self):
+    def _source_error(self) -> str:
+        """Why the open problem tab cannot be used; empty if it can."""
+        if self.source_tabs.currentIndex() == PLUGIN_TAB:
+            return self._plugin_error
+        return "" if self._classic_catalog else tf.is_available()[1]
+
+    def _on_source_changed(self, index: int):
         # Each tab has its own ranges: restore the formula ranges when switching back.
-        if self._test_mode():
-            self._formula_ranges = self._ranges()
-            if self._classic_catalog:
-                self._load_problem()
-        else:
+        if index == FORMULA_TAB:
             if self._formula_ranges is not None:
                 self._set_ranges(self._formula_ranges)
             self.build()
+        else:
+            if self._source_tab == FORMULA_TAB:
+                self._formula_ranges = self._ranges()
+            if not self._source_error():
+                self._load_problem()
+        self._source_tab = index
 
     def _on_family_changed(self):
         family = self.family_box.currentData()
@@ -497,18 +544,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self.number_spin.blockSignals(False)
         self._on_classic_changed()
 
-    def _on_classic_changed(self):
-        info = self.classic_box.currentData()
-        self.classic_dim.blockSignals(True)
-        self.classic_dim.setRange(min(info.dimensions), max(info.dimensions))
+    @staticmethod
+    def _set_dimension_choices(spin: QtWidgets.QSpinBox, dimensions: tuple):
+        spin.blockSignals(True)
+        spin.setRange(min(dimensions), max(dimensions))
         # e.g. powell exists only for multiples of 4
-        self.classic_dim.setSingleStep(info.dimensions[1] - info.dimensions[0] if len(info.dimensions) > 1 else 1)
-        self.classic_dim.setValue(2 if 2 in info.dimensions else min(info.dimensions))
-        self.classic_dim.blockSignals(False)
-        self.classic_dim.setEnabled(len(info.dimensions) > 1)
+        spin.setSingleStep(dimensions[1] - dimensions[0] if len(dimensions) > 1 else 1)
+        spin.setValue(2 if 2 in dimensions else min(dimensions))
+        spin.blockSignals(False)
+        spin.setEnabled(len(dimensions) > 1)
+
+    def _on_classic_changed(self):
+        self._set_dimension_choices(self.classic_dim, self.classic_box.currentData().dimensions)
+        self._load_problem()
+
+    def _on_plugin_changed(self):
+        self._set_dimension_choices(self.plugin_dim, self.plugin_box.currentData().dimensions)
         self._load_problem()
 
     def _current_problem(self) -> tf.TestProblem:
+        if self.source_tabs.currentIndex() == PLUGIN_TAB:
+            return self.plugin_box.currentData().create(self.plugin_dim.value())
         family = self.family_box.currentData()
         if family == CLASSIC_FAMILY:
             return tf.classic_problem(self.classic_box.currentText(), self.classic_dim.value())
@@ -536,7 +592,8 @@ class MainWindow(QtWidgets.QMainWindow):
             text += f"\nGlobal minimum: f* = {problem.optimum_value:.6g}\nat x* = ({point})"
         else:
             text += "\nGlobal minimum is unknown"
-        self.problem_info.setText(text)
+        info_label = self.plugin_info if self.source_tabs.currentIndex() == PLUGIN_TAB else self.problem_info
+        info_label.setText(text)
         self.build()
 
     # ---------- computation ----------
@@ -544,8 +601,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def build(self):
         try:
             if self._test_mode():
-                if not self._classic_catalog:
-                    raise ValueError(tf.is_available()[1])
+                if self._source_error():
+                    raise ValueError(self._source_error())
                 problem = self._current_problem()
                 dimension, title = problem.dimension, problem.title
                 optimum = None
