@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE settings (.idea/deployment.xml holds a private server address)
+.idea/
+.vscode/
+
+# Native build output: build it with native/build.py
+*.dll
+*.so
+*.dylib
+*.o
+*.obj
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
